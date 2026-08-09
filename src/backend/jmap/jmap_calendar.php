@@ -22,10 +22,21 @@ class JmapCalendarConverter {
         $a->uid     = $event['uid']   ?? '';
 
         // Time
-        $tz    = $event['timeZone'] ?? 'UTC';
-        $start = $event['start']    ?? '';
-        $startTs = $start ? self::localToTimestamp($start, $tz) : time();
-        $durSecs = self::parseDuration($event['duration'] ?? 'PT1H');
+        $start    = $event['start']    ?? '';
+        $tzRaw    = is_array($start) ? ($start['timeZone'] ?? $event['timeZone'] ?? 'UTC') : ($event['timeZone'] ?? 'UTC');
+        $tz       = is_array($tzRaw) ? 'UTC' : (string)$tzRaw;
+        $startTs  = self::jmapTimeToTimestamp($start, $tz);
+        $durSecs  = self::parseDuration($event['duration'] ?? 'PT1H');
+        $a->dtstamp  = $startTs ?: time();
+        if (class_exists('TimezoneUtil')) {
+            $phpTz = TimezoneUtil::GetPhpSupportedTimezone($tz);
+            try {
+                $fullTz = TimezoneUtil::GetFullTZFromTZName($phpTz);
+                $a->timezone = base64_encode(TimezoneUtil::GetSyncBlobFromTZ($fullTz));
+            } catch (\Throwable) {
+                $a->timezone = base64_encode(TimezoneUtil::GetSyncBlobFromTZ(TimezoneUtil::GetFullTZ()));
+            }
+        }
 
         $a->starttime   = $startTs;
         $a->endtime     = $startTs + $durSecs;
@@ -46,7 +57,8 @@ class JmapCalendarConverter {
         if ($locations) $a->location = $locations[0]['name'] ?? null;
 
         // Organizer + attendees
-        $attendees = [];
+        $attendees  = [];
+        $foundOrg   = false;
         foreach ($event['participants'] ?? [] as $p) {
             $roles = $p['roles'] ?? [];
             $name  = $p['name']  ?? '';
@@ -55,6 +67,7 @@ class JmapCalendarConverter {
             if (isset($roles['organizer'])) {
                 $a->organizername  = $name;
                 $a->organizeremail = $email;
+                $foundOrg          = true;
             } else {
                 $att = new SyncAttendee();
                 $att->name  = $name;
@@ -75,8 +88,24 @@ class JmapCalendarConverter {
             }
         }
         if ($attendees) {
-            $a->attendees    = $attendees;
-            $a->meetingstatus = 1;
+            $a->attendees = $attendees;
+            // If no explicit organizer found, use the first attendee as organizer
+            // (Stalwart may not always store the organizer role)
+            if (!$foundOrg) {
+                $a->organizername  = $attendees[0]->name  ?? '';
+                $a->organizeremail = $attendees[0]->email ?? '';
+                if (empty($a->organizername) && empty($a->organizeremail)) {
+                    ZLog::Write(LOGLEVEL_WARN, sprintf(
+                        'JmapCalendarConverter: event "%s" has attendees but no organizer info at all',
+                        $event['title'] ?? $event['uid'] ?? '(unknown)'
+                    ));
+                }
+            }
+            // Only mark as meeting if we have a valid organizer email,
+            // otherwise iOS may reject the event
+            if (!empty($a->organizeremail)) {
+                $a->meetingstatus = 1;
+            }
         }
 
         // Sensitivity
@@ -110,9 +139,9 @@ class JmapCalendarConverter {
             $a->recurrence = self::jmapRuleToSyncRecurrence($rules[0]);
         }
 
-        // Categories
+        // Categories (space-separated string for compatibility with all streamer mappings)
         $cats = array_keys($event['categories'] ?? []);
-        if ($cats) $a->categories = $cats;
+        if ($cats) $a->categories = implode(' ', $cats);
 
         return $a;
     }
@@ -149,9 +178,21 @@ class JmapCalendarConverter {
             $event['locations'] = ['l1' => ['@type' => 'Location', 'name' => $a->location]];
         }
 
-        // Description
+        // Description — handle both old-style body (string) and AirSyncBase body (SyncBaseBody)
+        $descText = null;
         if (!empty($a->body)) {
-            $event['description'] = $a->body;
+            $descText = $a->body;
+        } elseif (!empty($a->asbody) && $a->asbody instanceof SyncBaseBody) {
+            $data = $a->asbody->data;
+            if (is_resource($data)) {
+                $descText = stream_get_contents($data);
+                rewind($data);
+            } elseif (is_string($data) && $data !== '') {
+                $descText = $data;
+            }
+        }
+        if ($descText !== null && $descText !== '') {
+            $event['description'] = $descText;
         }
 
         // Organizer + attendees
@@ -219,11 +260,15 @@ class JmapCalendarConverter {
             if ($rule) $event['recurrenceRules'] = [$rule];
         }
 
-        // Categories
+        // Categories (handle both space-separated string and array from device)
         if (!empty($a->categories)) {
             $cats = [];
-            foreach ($a->categories as $cat) $cats[$cat] = true;
-            $event['categories'] = $cats;
+            $catList = is_array($a->categories) ? $a->categories : explode(' ', $a->categories);
+            foreach ($catList as $cat) {
+                $cat = trim($cat);
+                if ($cat !== '') $cats[$cat] = true;
+            }
+            if ($cats) $event['categories'] = $cats;
         }
 
         return $event;
@@ -234,10 +279,29 @@ class JmapCalendarConverter {
     // -------------------------------------------------------------------------
 
     public static function eventModHash(array $event): string {
+        $startTs = self::jmapTimeToTimestamp($event['start'] ?? '');
         $key = ($event['title'] ?? '') .
-               ($event['start'] ?? '') .
+               $startTs .
                ($event['duration'] ?? '') .
-               ($event['updated'] ?? '');
+               ($event['description'] ?? '') .
+               (($event['locations'][array_key_first($event['locations'] ?? [])]['name'] ?? ''));
+        foreach ($event['participants'] ?? [] as $p) {
+            $key .= '|p:' . ($p['name'] ?? '') . ':' . ($p['email'] ?? '') .
+                    ':' . ($p['participationStatus'] ?? '');
+        }
+        $key .= '|priv:' . ($event['privacy'] ?? 'public');
+        $key .= '|fb:' . ($event['freeBusyStatus'] ?? 'busy');
+        foreach (array_keys($event['categories'] ?? []) as $cat) {
+            $key .= '|cat:' . $cat;
+        }
+        if (!empty($event['recurrenceRules'])) {
+            $key .= '|rr:' . count($event['recurrenceRules']);
+        }
+        $key .= '|allday:' . (!empty($event['showWithoutTime']) ? '1' : '0');
+        foreach ($event['alerts'] ?? [] as $al) {
+            $key .= '|alert:' . ($al['trigger']['offset'] ?? '');
+        }
+        $key .= '|' . ($event['updated'] ?? '');
         return sprintf('%08x', crc32($key));
     }
 
@@ -343,6 +407,25 @@ class JmapCalendarConverter {
     // -------------------------------------------------------------------------
     // Time utilities
     // -------------------------------------------------------------------------
+
+    public static function jmapTimeToTimestamp($jmapTime, string $defaultTz = 'UTC'): int {
+        if (is_array($jmapTime)) {
+            $dateStr = $jmapTime['date'] ?? '';
+            $tzStr   = $jmapTime['timeZone'] ?? $defaultTz;
+        } else {
+            $dateStr = (string)$jmapTime;
+            $tzStr   = $defaultTz;
+        }
+        if (!$dateStr) return 0;
+        try {
+            if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateStr)) {
+                $dateStr .= 'T00:00:00';
+            }
+            return (new \DateTime($dateStr, new \DateTimeZone($tzStr)))->getTimestamp();
+        } catch (\Throwable) {
+            return 0;
+        }
+    }
 
     public static function localToTimestamp(string $datetime, string $tz): int {
         try {
